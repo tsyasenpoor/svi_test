@@ -9,11 +9,139 @@ import jax.scipy as jsp
 import matplotlib.pyplot as plt
 import os
 
-from vi_model_complete import (
-    SupervisedPoissonFactorization,
-    logistic,
-    lambda_jj,
-)
+# Local helper functions and model definition to keep SVI self contained.
+def lambda_jj(zeta):
+    """Jaakola-Jordan lambda function with numerical stability."""
+    zeta_safe = jnp.maximum(jnp.abs(zeta), 1e-6)
+    result = jnp.where(
+        jnp.abs(zeta) < 1e-6,
+        1 / 8,
+        (1 / (4 * zeta_safe)) * jnp.tanh(zeta_safe / 2),
+    )
+    return jnp.clip(result, 1e-8, 100.0)
+
+
+def logistic(x):
+    """Numerically stable logistic function."""
+    return 1 / (1 + jnp.exp(-x))
+
+
+class SupervisedPoissonFactorization:
+    """Minimal model needed for SVI."""
+
+    def __init__(
+        self,
+        n_samples,
+        n_genes,
+        n_factors,
+        n_outcomes,
+        alpha_eta=1.0,
+        lambda_eta=1.0,
+        alpha_beta=1.0,
+        alpha_xi=1.0,
+        lambda_xi=1.0,
+        alpha_theta=1.0,
+        sigma2_gamma=1.0,
+        sigma2_v=1.0,
+        key=None,
+    ):
+        self.n, self.p, self.K, self.kappa = (
+            n_samples,
+            n_genes,
+            n_factors,
+            n_outcomes,
+        )
+        self.alpha_eta, self.lambda_eta = alpha_eta, lambda_eta
+        self.alpha_beta, self.alpha_xi = alpha_beta, alpha_xi
+        self.lambda_xi, self.alpha_theta = lambda_xi, alpha_theta
+        self.sigma2_gamma, self.sigma2_v = sigma2_gamma, sigma2_v
+
+        if key is None:
+            key = random.PRNGKey(0)
+        self.key = key
+
+    def initialize_parameters(self, X, Y, X_aux):
+        """Data-driven initialization used as a fall back."""
+        keys = random.split(self.key, 5)
+
+        gene_means = jnp.mean(X, axis=0)
+        sample_totals = jnp.sum(X, axis=1)
+
+        theta_init = jnp.outer(sample_totals / jnp.mean(sample_totals), jnp.ones(self.K))
+        theta_init = jnp.maximum(theta_init, 0.1)
+        beta_init = jnp.outer(gene_means / jnp.mean(gene_means), jnp.ones(self.K))
+        beta_init = jnp.maximum(beta_init, 0.1)
+
+        theta_var = theta_init * 0.3
+        a_theta = jnp.clip((theta_init ** 2) / theta_var, 0.5, 10.0)
+        b_theta = jnp.clip(theta_init / theta_var, 0.5, 10.0)
+
+        beta_var = beta_init * 0.3
+        a_beta = jnp.clip((beta_init ** 2) / beta_var, 0.5, 10.0)
+        b_beta = jnp.clip(beta_init / beta_var, 0.5, 10.0)
+
+        a_eta = jnp.full(self.p, self.alpha_eta + self.K * self.alpha_beta)
+        b_eta = self.lambda_eta + jnp.mean(a_beta / b_beta, axis=1)
+
+        a_xi = jnp.full(self.n, self.alpha_xi + self.K * self.alpha_theta)
+        b_xi = self.lambda_xi + jnp.sum(a_theta / b_theta, axis=1)
+
+        gamma_init = random.normal(keys[0], (self.kappa, X_aux.shape[1])) * 0.1
+        mu_gamma = gamma_init
+        tau2_gamma = jnp.ones((self.kappa, X_aux.shape[1])) * self.sigma2_gamma
+
+        v_init = random.normal(keys[1], (self.kappa, self.K)) * 0.1
+        mu_v = v_init
+        tau2_v = jnp.ones((self.kappa, self.K)) * self.sigma2_v
+
+        expected_linear = (a_theta / b_theta) @ mu_v.T + X_aux @ mu_gamma.T
+        if expected_linear.ndim == 1:
+            expected_linear = expected_linear[:, None]
+        zeta = jnp.abs(expected_linear) + 0.1
+
+        return {
+            "a_eta": a_eta,
+            "b_eta": b_eta,
+            "a_xi": a_xi,
+            "b_xi": b_xi,
+            "a_beta": a_beta,
+            "b_beta": b_beta,
+            "a_theta": a_theta,
+            "b_theta": b_theta,
+            "mu_gamma": mu_gamma,
+            "tau2_gamma": tau2_gamma,
+            "mu_v": mu_v,
+            "tau2_v": tau2_v,
+            "zeta": zeta,
+        }
+
+    def expected_values(self, params):
+        """Return expectations of latent variables."""
+        E_eta = params["a_eta"] / params["b_eta"]
+        E_xi = params["a_xi"] / params["b_xi"]
+        E_beta = params["a_beta"] / params["b_beta"]
+        E_theta = params["a_theta"] / params["b_theta"]
+        E_gamma = params["mu_gamma"]
+        E_v = params["mu_v"]
+
+        E_theta_sq = (params["a_theta"] / params["b_theta"] ** 2) * (params["a_theta"] + 1)
+        E_theta_theta_T = jnp.expand_dims(E_theta_sq, -1) * jnp.eye(self.K) + jnp.expand_dims(E_theta, -1) @ jnp.expand_dims(E_theta, -2)
+
+        return {
+            "E_eta": E_eta,
+            "E_xi": E_xi,
+            "E_beta": E_beta,
+            "E_theta": E_theta,
+            "E_gamma": E_gamma,
+            "E_v": E_v,
+            "E_theta_theta_T": E_theta_theta_T,
+        }
+
+    def update_z_latent(self, X, E_theta, E_beta):
+        rates = jnp.expand_dims(E_theta, 1) * jnp.expand_dims(E_beta, 0)
+        total_rates = jnp.sum(rates, axis=2, keepdims=True)
+        probs = rates / (total_rates + 1e-8)
+        return jnp.expand_dims(X, 2) * probs
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -422,22 +550,15 @@ def fit_svi_corrected(model, X, Y, X_aux, n_iter=1000, batch_size=36, learning_r
                 X_batch, Y_batch, X_aux_batch, batch_idx, scale, mask
             )
             
-            # FIXED: Apply updates with less conservative clipping
+            # Apply updates with mild clipping only for numerical stability
             for param_name, update in ng_results.items():
                 if param_name in params:
-                    if param_name == 'mu_v':
-                        # More aggressive v updates with positive bias
-                        params[param_name] = jnp.clip(update, 0.1, 5.0)  # Force positive
-                    elif param_name == 'mu_gamma':
-                        # More aggressive gamma updates with positive bias
-                        params[param_name] = jnp.clip(update, 0.1, 5.0)  # Force positive
-                    elif param_name == 'tau2_v':
-                        params[param_name] = jnp.clip(update, 0.05, 5.0)
-                    elif param_name == 'tau2_gamma':
-                        params[param_name] = jnp.clip(update, 0.05, 5.0)
+                    if param_name in ('mu_v', 'mu_gamma'):
+                        params[param_name] = jnp.clip(update, -5.0, 5.0)
+                    elif param_name in ('tau2_v', 'tau2_gamma'):
+                        params[param_name] = jnp.clip(update, 1e-6, 10.0)
                     else:
-                        # For other parameters, use standard clipping
-                        params[param_name] = jnp.clip(update, 1e-8, 1e6)
+                        params[param_name] = jnp.clip(update, 1e-6, 1e6)
             
         except Exception as e:
             if verbose:
